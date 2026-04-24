@@ -6,9 +6,9 @@ from bs4 import BeautifulSoup
 
 # --- CONFIGURATIONS ---
 # You can set these directly or use environment variables
-GRAND_PANEL_URL = "https://api.grand-panel.com"
-USERNAME = "Team123"
-PASSWORD = "Team123"
+PANEL_URL = "http://51.89.99.105/NumberPanel"
+USERNAME = "asik123"
+PASSWORD = "asik123"
 TELEGRAM_TOKEN = "7735071779:AAEFTzb4vVhweKEP9wem5b44LOjpjwU8_rA"
 TELEGRAM_CHAT_ID = "-1003578388211"
 
@@ -30,9 +30,36 @@ def mask_number(num):
     return f"{first_3}DXA{last_4}"
 
 def extract_otp(text):
-    # Matches 3-3 digits (e.g. 349-734) or 4-8 continuous digits
-    match = re.search(r'(\d{3}-\d{3})|(\d{4,8})', text)
-    return match.group(0) if match else "No OTP Found"
+    # 1. Try common multi-part OTPs (e.g., 123-456, 123 456)
+    multi_part = re.search(r'(\d{3}[-\s]\d{3})|(\d{2}[-\s]\d{2}[-\s]\d{2})', text)
+    if multi_part:
+        return multi_part.group(0)
+
+    # 2. Look for keywords and capture the nearest digit sequence
+    # Matches: "code 1234", "is 123456", "otp: 9876"
+    keyword_match = re.search(r'(?:code|is|otp|pin|verification|auth|verification code|is|কোড)\s*(?:is|:|-)?\s*(\d{4,10})', text, re.I)
+    if keyword_match:
+        return keyword_match.group(1)
+
+    # 3. Just look for any 4-8 digit continuous sequence
+    simple_match = re.search(r'\d{4,8}', text)
+    if simple_match:
+        return simple_match.group(0)
+
+    return "No OTP Found"
+
+def solve_captcha(text):
+    try:
+        # Matches 2 + 6, 10 - 5, etc.
+        match = re.search(r'(\d+)\s*([\+\-])\s*(\d+)', text)
+        if match:
+            a = int(match.group(1))
+            op = match.group(2)
+            b = int(match.group(3))
+            return str(a + b) if op == '+' else str(a - b)
+    except Exception as e:
+        log(f"Error solving captcha: {e}")
+    return "0"
 
 def send_to_telegram(text, otp=None):
     try:
@@ -59,28 +86,65 @@ def send_to_telegram(text, otp=None):
 
 def login():
     try:
-        log(f"Attempting to login to {GRAND_PANEL_URL}...")
-        login_page = session.get(f"{GRAND_PANEL_URL}/login")
-        soup = BeautifulSoup(login_page.text, 'html.parser')
+        log(f"Attempting to login to {PANEL_URL}/login...")
+        login_res = session.get(f"{PANEL_URL}/login")
+        soup = BeautifulSoup(login_res.text, 'html.parser')
         
-        # Collect hidden form fields (tokens/csrf)
+        # Solve math captcha
+        all_text = login_res.text
+        captcha_match = re.search(r'(\d+\s*[\+\-]\s*\d+)\s*=', all_text)
+        if not captcha_match:
+            labels = soup.find_all(["label", "div", "span"])
+            for l in labels:
+                if "+" in l.text or "-" in l.text:
+                    captcha_match = re.search(r'(\d+\s*[\+\-]\s*\d+)', l.text)
+                    if captcha_match: break
+        
+        captcha_text = captcha_match.group(1) if captcha_match else "0 + 0"
+        answer = solve_captcha(captcha_text)
+        log(f"Captcha Info: Text='{captcha_text}', Answer='{answer}'")
+
+        # Form detection
+        form = soup.find("form")
+        if not form:
+            log("❌ No login form found.")
+            return False
+            
+        action = form.get("action")
+        login_post_url = f"{PANEL_URL}/login"
+        if action:
+            from urllib.parse import urljoin
+            login_post_url = urljoin(f"{PANEL_URL}/login", action)
+
         form_data = {}
-        for hidden_input in soup.find_all("input", type="hidden"):
-            name = hidden_input.get("name")
-            value = hidden_input.get("value")
-            if name and value:
-                form_data[name] = value
+        for hidden in form.find_all("input", type="hidden"):
+            name = hidden.get("name")
+            if name: form_data[name] = hidden.get("value") or ""
         
-        form_data["username"] = USERNAME
-        form_data["password"] = PASSWORD
+        # Detect inputs
+        user_input = form.find("input", {"name": re.compile(r"user|email|id", re.I)}) or form.find("input", {"type": "text"})
+        pass_input = form.find("input", {"name": re.compile(r"pass", re.I)}) or form.find("input", {"type": "password"})
+        captcha_input = form.find("input", {"placeholder": re.compile(r"answer|ans|code", re.I)}) or \
+                        form.find("input", {"name": re.compile(r"ans|captcha", re.I)})
         
-        res = session.post(f"{GRAND_PANEL_URL}/login", data=form_data, allow_redirects=False)
+        user_field = user_input.get("name") if user_input else "username"
+        pass_field = pass_input.get("name") if pass_input else "password"
+        captcha_field = captcha_input.get("name") if captcha_input else "answer"
+
+        form_data[user_field] = USERNAME
+        form_data[pass_field] = PASSWORD
+        form_data[captcha_field] = answer
         
-        if res.status_code == 302 or 'logout' in session.get(f"{GRAND_PANEL_URL}/").text.lower():
+        log(f"Submitting form to: {login_post_url}")
+        res = session.post(login_post_url, data=form_data, allow_redirects=True)
+        
+        # Success check
+        check_res = session.get(f"{PANEL_URL}/client/SMSCDRStats")
+        if 'logout' in res.text.lower() or 'SMS Reports' in check_res.text or 'Dashboard' in check_res.text:
             log("✅ Login Successful!")
             return True
         else:
-            log("❌ Login Failed. Check credentials.")
+            log(f"❌ Login Failed (Status: {res.status_code}). Check details.")
             return False
     except Exception as e:
         log(f"❌ Login Error: {e}")
@@ -89,14 +153,16 @@ def login():
 def check_cdrs():
     global last_seen_cdr_id
     try:
-        res = session.get(f"{GRAND_PANEL_URL}/cdrs")
+        cdr_url = f"{PANEL_URL}/client/SMSCDRStats"
+        res = session.get(cdr_url)
         
         # Check if session expired
-        if "sign in to your account" in res.text.lower():
-            log("⚠️ Session expired. Re-logging...")
-            if login():
-                return check_cdrs()
-            return
+        if "sign in to your account" in res.text.lower() or "welcome back" in res.text.lower():
+            if "SMS Reports" not in res.text:
+                log("⚠️ Session expired. Re-logging...")
+                if login():
+                    return check_cdrs()
+                return
 
         soup = BeautifulSoup(res.text, 'html.parser')
         rows = soup.find_all("tr")
@@ -104,14 +170,16 @@ def check_cdrs():
         cdrs = []
         for row in rows:
             cols = row.find_all("td")
-            if len(cols) >= 8:
+            if len(cols) >= 6:
                 cdr_date = cols[0].get_text(strip=True)
-                number = cols[4].get_text(strip=True)
-                cli = cols[5].get_text(strip=True)
-                message_id = cols[6].get_text(strip=True)
-                sms_body = cols[7].get_text(strip=True)
+                number = cols[2].get_text(strip=True)
+                cli = cols[3].get_text(strip=True)
+                sms_body = cols[5].get_text(strip=True)
                 
-                if len(message_id) > 5:
+                # Unique ID
+                message_id = re.sub(r'\s+', '', f"{cdr_date}_{number}_{cli}")
+                
+                if number and sms_body:
                     cdrs.append({
                         "date": cdr_date,
                         "number": number,

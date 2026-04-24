@@ -12,9 +12,9 @@ const app = express();
 const PORT = 3000;
 
 // Configurations from env
-const GRAND_PANEL_URL = process.env.GRAND_PANEL_URL || 'https://api.grand-panel.com';
-const USERNAME = process.env.GRAND_PANEL_USERNAME || 'Team123';
-const PASSWORD = process.env.GRAND_PANEL_PASSWORD || 'Team123';
+const PANEL_URL = process.env.NUMBER_PANEL_URL || 'http://51.89.99.105/NumberPanel';
+const USERNAME = process.env.NUMBER_PANEL_USERNAME || 'asik123';
+const PASSWORD = process.env.NUMBER_PANEL_PASSWORD || 'asik123';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '7735071779:AAEFTzb4vVhweKEP9wem5b44LOjpjwU8_rA';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '-1003578388211';
 
@@ -82,86 +82,126 @@ async function sendToTelegram(message: string, otp: string | null = null) {
 }
 
 function extractOTP(text: string): string {
-  // Matches 3-3 digits (e.g. 349-734) or 4-8 continuous digits
-  const match = text.match(/(\d{3}-\d{3})|(\d{4,8})/);
-  return match ? match[0] : 'No OTP Found';
+  // 1. Try common multi-part OTPs (e.g., 123-456, 123 456)
+  const multiPartMatch = text.match(/(\d{3}[-\s]\d{3})|(\d{2}[-\s]\d{2}[-\s]\d{2})/);
+  if (multiPartMatch) return multiPartMatch[0];
+
+  // 2. Look for keywords and capture the nearest digit sequence
+  // Matches: "code 1234", "is 123456", "otp: 9876", "কোড হলো ১২৩৪"
+  const keywordMatch = text.match(/(?:code|is|otp|pin|verification|auth|verification code|is|কোড)\s*(?:is|:|-)?\s*(\d{4,10})/i);
+  if (keywordMatch) return keywordMatch[1];
+
+  // 3. Just look for any 4-8 digit continuous sequence
+  const simpleMatch = text.match(/\d{4,8}/);
+  if (simpleMatch) return simpleMatch[0];
+
+  return 'No OTP Found';
 }
 
-// Login to Grand Panel
+function solveCaptcha(text: string): string {
+  try {
+    // Matches 2 + 6, 10 - 5, etc.
+    const match = text.match(/(\d+)\s*([\+\-])\s*(\d+)/);
+    if (match) {
+      const a = parseInt(match[1]);
+      const op = match[2];
+      const b = parseInt(match[3]);
+      return op === '+' ? (a + b).toString() : (a - b).toString();
+    }
+  } catch (e) {
+    addLog('Error solving captcha: ' + text);
+  }
+  return '0';
+}
+
+// Login to Panel
 async function loginToPanel() {
   try {
-    addLog(`Fetching login page from ${GRAND_PANEL_URL}...`);
-    const getRes = await axios.get(`${GRAND_PANEL_URL}/login`, {
+    const loginUrl = `${PANEL_URL}/login`;
+    addLog(`Fetching login page from ${loginUrl}...`);
+    const getRes = await axios.get(loginUrl, {
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
     });
-    
+
     const $ = cheerio.load(getRes.data);
     const cookies = getRes.headers['set-cookie'] || [];
     const cookieHeader = cookies.join('; ');
 
-    // Extract CSRF or hidden tokens
+    // Solve math captcha from text or labels
+    // Patterns: "What is 2 + 6 = ?", "2 + 6 ="
+    const bodyText = $('body').text();
+    const captchaMatch = bodyText.match(/(\d+\s*\+\s*\d+)\s*=/i) || 
+                         $('label:contains("+")').text().match(/(\d+\s*\+\s*\d+)/) ||
+                         $('div:contains("+")').last().text().match(/(\d+\s*\+\s*\d+)/);
+    
+    const captchaText = captchaMatch ? captchaMatch[1] : null;
+    const answer = captchaText ? solveCaptcha(captchaText) : '0';
+    addLog(`Captcha Info: Text="${captchaText || 'Not Found'}", Answer="${answer}"`);
+
     const formData = new URLSearchParams();
-    $('form input[type="hidden"]').each((i, el) => {
+    
+    // Auto-detect form settings
+    const $form = $('form').first();
+    const actionAttr = $form.attr('action');
+    const loginPostUrl = actionAttr ? (actionAttr.startsWith('http') ? actionAttr : new URL(actionAttr, loginUrl).href) : loginUrl;
+    
+    const usernameInput = $('input[name*="user" i], input[placeholder*="username" i]').first();
+    const passwordInput = $('input[name*="pass" i], input[type="password"]').first();
+    const answerInput = $('input[placeholder*="answer" i], input[name*="answer" i], input[name*="ans" i]').first();
+
+    const userField = usernameInput.attr('name') || 'username';
+    const passField = passwordInput.attr('name') || 'password';
+    const captchaField = answerInput.attr('name') || 'answer';
+
+    addLog(`Form Info: Action="${loginPostUrl}", User="${userField}", Pass="${passField}", Captcha="${captchaField}"`);
+
+    // Collect all hidden fields (CSRF tokens etc)
+    $form.find('input[type="hidden"]').each((i, el) => {
         const name = $(el).attr('name');
         const value = $(el).attr('value');
-        if (name && value) {
-            formData.append(name, value);
-        }
+        if (name) formData.append(name, value || '');
     });
 
-    formData.append('username', USERNAME);
-    formData.append('password', PASSWORD);
+    formData.append(userField, USERNAME);
+    formData.append(passField, PASSWORD);
+    formData.append(captchaField, answer);
     
-    addLog('Submitting credentials...');
-    const postRes = await axios.post(`${GRAND_PANEL_URL}/login`, formData, {
+    addLog(`Submitting login to ${loginPostUrl}...`);
+    const parsedPanelUrl = new URL(PANEL_URL);
+    const origin = `${parsedPanelUrl.protocol}//${parsedPanelUrl.host}`;
+
+    const postRes = await axios.post(loginPostUrl, formData.toString(), {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Cookie': cookieHeader,
-        'Referer': `${GRAND_PANEL_URL}/login`,
+        'Referer': loginUrl,
+        'Origin': origin,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
       },
       maxRedirects: 0,
-      validateStatus: (status) => status >= 200 && status < 405
+      validateStatus: () => true
     });
 
-    const newCookies = postRes.headers['set-cookie'] || [];
-    sessionCookie = newCookies.length > 0 ? newCookies.join('; ') : cookieHeader;
+    const respCookies = postRes.headers['set-cookie'] || [];
+    // Combine initial cookies with response cookies
+    sessionCookie = [...cookies, ...respCookies].join('; ');
     
-    if (postRes.status === 302 || postRes.headers.location) {
-      addLog('Login successful! Dashboard reached.');
+    // Check success via redirect or content
+    if (postRes.status === 302 || postRes.headers.location || postRes.data.includes('Dashboard') || postRes.data.includes('SMS Reports') || postRes.data.toLowerCase().includes('logout')) {
+      addLog('✅ Login Successful!');
       botStatus = 'Running (LoggedIn)';
-      
-      // Try to find correct ticket path by visiting home
-      try {
-        const homeRes = await axios.get(`${GRAND_PANEL_URL}/`, {
-            headers: { 'Cookie': sessionCookie, 'User-Agent': 'Mozilla/5.0' }
-        });
-        const $home = cheerio.load(homeRes.data);
-        const ticketLink = $home('a[href*="ticket"], a[href*="support"], a[href*="message"]').first().attr('href');
-        if (ticketLink) {
-            addLog(`Found potential ticket path: ${ticketLink}`);
-            // If it's a relative path, prepend URL if needed
-        }
-      } catch (e) {
-          addLog('Could not scrape home page for links.');
-      }
-      
       return true;
     } else {
-        const $dashboard = cheerio.load(postRes.data);
-        if ($dashboard('a[href*="logout"]').length > 0) {
-            addLog('Login successful (Already logged in or direct access).');
-            botStatus = 'Running (LoggedIn)';
-            return true;
-        }
-        addLog('Login failed: Check credentials or panel security.');
+        const $resPage = cheerio.load(postRes.data);
+        const errorText = $resPage('.alert-danger, .error-msg, [class*="error"]').text().trim();
+        addLog(`❌ Login Failed (Status: ${postRes.status}). ${errorText ? 'Portal says: ' + errorText : 'No error message found on page.'}`);
         botStatus = 'Error (Login Failed)';
         return false;
     }
   } catch (error: any) {
-    addLog(`Login Error: ${error.message}`);
+    addLog(`❌ Connection Error during login: ${error.message}`);
     botStatus = 'Error (Connection)';
     return false;
   }
@@ -175,33 +215,38 @@ async function checkCDRs() {
   }
 
   try {
-    const res = await axios.get(`${GRAND_PANEL_URL}/cdrs`, {
+    const cdrUrl = `${PANEL_URL}/client/SMSCDRStats`;
+    const res = await axios.get(cdrUrl, {
       headers: { 
           'Cookie': sessionCookie,
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Referer': `${GRAND_PANEL_URL}/cdrs`
+          'Referer': cdrUrl
       }
     });
 
     const $ = cheerio.load(res.data);
     
     // Check if session expired
-    if ($('form[action*="login"]').length > 0 || res.data.includes('Sign in to your account')) {
-        addLog('⚠️ Session expired. Re-logging...');
-        sessionCookie = '';
-        await loginToPanel();
-        return;
+    if ($('form[action*="login"]').length > 0 || res.data.includes('Sign in to your account') || res.data.includes('Welcome back')) {
+        if (!res.data.includes('SMS Reports')) {
+          addLog('⚠️ Session expired or redirected to login. Re-logging...');
+          sessionCookie = '';
+          await loginToPanel();
+          return;
+        }
     }
 
     const cdrs: any[] = [];
     $('table tbody tr').each((i, el) => {
       const date = $(el).find('td').eq(0).text().trim();
-      const number = $(el).find('td').eq(4).text().trim();
-      const cli = $(el).find('td').eq(5).text().trim();
-      const messageId = $(el).find('td').eq(6).text().trim();
-      const smsBody = $(el).find('td').eq(7).text().trim();
+      const number = $(el).find('td').eq(2).text().trim();
+      const cli = $(el).find('td').eq(3).text().trim();
+      const smsBody = $(el).find('td').eq(5).text().trim();
 
-      if (messageId && messageId.length > 5) {
+      // Create a unique ID if none exists
+      const messageId = `${date}_${number}_${cli}`.replace(/\s+/g, '');
+
+      if (number && smsBody) {
         cdrs.push({ date, number, cli, messageId, smsBody });
       }
     });
@@ -269,7 +314,7 @@ async function start() {
 
   app.post('/api/test-telegram', async (req, res) => {
     addLog('Manual Telegram Test Triggered.');
-    const success = await sendToTelegram('<b>🔔 Test Message</b>\n\nYour Grand Panel Forwarder is working correctly!');
+    const success = await sendToTelegram('<b>🔔 Test Message</b>\n\nYour Number Panel Forwarder is working correctly!');
     res.json({ success });
   });
 
