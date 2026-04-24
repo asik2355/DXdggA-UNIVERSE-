@@ -1,0 +1,6 @@
+{
+  "name": "Grand Panel OTP Forwarder",
+  "description": "Logins to Grand Panel and forwards incoming messages/tickets to a Telegram group.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
