@@ -82,18 +82,37 @@ async function sendToTelegram(message: string, otp: string | null = null) {
 }
 
 function extractOTP(text: string): string {
-  // 1. Try common multi-part OTPs (e.g., 123-456, 123 456)
-  const multiPartMatch = text.match(/(\d{3}[-\s]\d{3})|(\d{2}[-\s]\d{2}[-\s]\d{2})/);
+  // Normalize text: handle common localized number formats or variations
+  const cleanText = text.replace(/[\u200B-\u200D\uFEFF]/g, ''); // Remove zero-width spaces
+
+  // 1. Specific Patterns (WhatsApp, Imo, etc. often use hyphenated or spaced codes)
+  // Matches: 123-456, 123 456, 12-34-56
+  const multiPartMatch = cleanText.match(/(\d{3}[-\s]\d{3})|(\d{2}[-\s]\d{2}[-\s]\d{2})/);
   if (multiPartMatch) return multiPartMatch[0];
 
-  // 2. Look for keywords and capture the nearest digit sequence
-  // Matches: "code 1234", "is 123456", "otp: 9876", "কোড হলো ১২৩৪"
-  const keywordMatch = text.match(/(?:code|is|otp|pin|verification|auth|verification code|is|কোড)\s*(?:is|:|-)?\s*(\d{4,10})/i);
-  if (keywordMatch) return keywordMatch[1];
+  // 2. Keyword-based extraction
+  // Handles English, Bengali, Arabic keywords for "code" or "is"
+  // Keywords: code, is, otp, pin, verification, কোড, رمز, verification code, your code
+  const otpPatterns = [
+    /(?:code|is|otp|pin|verification|auth|verification code|কোড|رمز|your code)\s*(?:is|:|-|=)?\s*([a-z0-9]{4,10})/i,
+    /([a-z0-9]{4,10})\s*(?:is your|is the|কোড)/i,
+    /verification code\s*:?\s*([a-z0-9]{4,10})/i
+  ];
 
-  // 3. Just look for any 4-8 digit continuous sequence
-  const simpleMatch = text.match(/\d{4,8}/);
-  if (simpleMatch) return simpleMatch[0];
+  for (const pattern of otpPatterns) {
+    const match = cleanText.match(pattern);
+    if (match && match[1]) return match[1];
+  }
+
+  // 3. Falling back to any sequence of 4-10 digits that looks like a code
+  // We avoid taking long strings like phone numbers by limiting to 10 digits
+  const digitMatches = cleanText.match(/\d{4,10}/g);
+  if (digitMatches) {
+    // Filter out potential phone numbers (usually > 10 digits in many regions, or start with country code)
+    // For a simple heuristic, we pick the first 4-8 digit sequence
+    const codes = digitMatches.filter(d => d.length >= 4 && d.length <= 8);
+    if (codes.length > 0) return codes[0];
+  }
 
   return 'No OTP Found';
 }
@@ -236,12 +255,32 @@ async function checkCDRs() {
         }
     }
 
+    // Smart Column Detection
+    let dateIdx = -1, numberIdx = -1, cliIdx = -1, smsIdx = -1;
+    
+    $('table thead tr th, table tr th').each((i, el) => {
+        const text = $(el).text().toLowerCase().trim();
+        if (text.includes('date') || text.includes('time')) dateIdx = i;
+        if (text.includes('number') || text.includes('phone') || text.includes('destination')) numberIdx = i;
+        if (text.includes('cli') || text.includes('sender') || text.includes('from')) cliIdx = i;
+        if (text.includes('sms') || text.includes('body') || text.includes('message')) smsIdx = i;
+    });
+
+    // Fallback indices if header detection fails
+    if (dateIdx === -1) dateIdx = 0;
+    if (numberIdx === -1) numberIdx = 2;
+    if (cliIdx === -1) cliIdx = 3;
+    if (smsIdx === -1) smsIdx = 5;
+
     const cdrs: any[] = [];
     $('table tbody tr').each((i, el) => {
-      const date = $(el).find('td').eq(0).text().trim();
-      const number = $(el).find('td').eq(2).text().trim();
-      const cli = $(el).find('td').eq(3).text().trim();
-      const smsBody = $(el).find('td').eq(5).text().trim();
+      const $tds = $(el).find('td');
+      if ($tds.length < 4) return; // Skip empty rows
+
+      const date = $tds.eq(dateIdx).text().trim();
+      const number = $tds.eq(numberIdx).text().trim();
+      const cli = $tds.eq(cliIdx).text().trim();
+      const smsBody = $tds.eq(smsIdx).text().trim();
 
       // Create a unique ID if none exists
       const messageId = `${date}_${number}_${cli}`.replace(/\s+/g, '');

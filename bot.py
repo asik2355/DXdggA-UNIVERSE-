@@ -30,21 +30,32 @@ def mask_number(num):
     return f"{first_3}DXA{last_4}"
 
 def extract_otp(text):
-    # 1. Try common multi-part OTPs (e.g., 123-456, 123 456)
-    multi_part = re.search(r'(\d{3}[-\s]\d{3})|(\d{2}[-\s]\d{2}[-\s]\d{2})', text)
+    # Normalize text
+    clean_text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
+
+    # 1. Multi-part OTPs
+    multi_part = re.search(r'(\d{3}[-\s]\d{3})|(\d{2}[-\s]\d{2}[-\s]\d{2})', clean_text)
     if multi_part:
         return multi_part.group(0)
 
-    # 2. Look for keywords and capture the nearest digit sequence
-    # Matches: "code 1234", "is 123456", "otp: 9876"
-    keyword_match = re.search(r'(?:code|is|otp|pin|verification|auth|verification code|is|কোড)\s*(?:is|:|-)?\s*(\d{4,10})', text, re.I)
+    # 2. Keyword-based extraction
+    otp_keywords = ['code', 'is', 'otp', 'pin', 'verification', 'auth', 'কোড', 'رمز', 'your code']
+    keywords_pattern = '|'.join(otp_keywords)
+    
+    keyword_match = re.search(rf'(?:{keywords_pattern})\s*(?:is|:|-|=)?\s*([a-z0-9]{{4,10}})', clean_text, re.I)
     if keyword_match:
         return keyword_match.group(1)
+        
+    keyword_match_rev = re.search(rf'([a-z0-9]{{4,10}})\s*(?:is your|is the|কোড)', clean_text, re.I)
+    if keyword_match_rev:
+        return keyword_match_rev.group(1)
 
-    # 3. Just look for any 4-8 digit continuous sequence
-    simple_match = re.search(r'\d{4,8}', text)
-    if simple_match:
-        return simple_match.group(0)
+    # 3. Digit sequences fallback
+    digit_matches = re.findall(r'\d{4,10}', clean_text)
+    if digit_matches:
+        codes = [d for d in digit_matches if 4 <= len(d) <= 8]
+        if codes:
+            return codes[0]
 
     return "No OTP Found"
 
@@ -165,16 +176,33 @@ def check_cdrs():
                 return
 
         soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # Smart Column Detection
+        date_idx, number_idx, cli_idx, sms_idx = 0, 2, 3, 5
+        header = soup.find("thead") or soup.find("tr")
+        if header:
+            ths = header.find_all(["th", "td"])
+            for i, th in enumerate(ths):
+                txt = th.get_text().lower()
+                if "date" in txt or "time" in txt: date_idx = i
+                if "number" in txt or "phone" in txt or "destination" in txt: number_idx = i
+                if "cli" in txt or "sender" in txt or "from" in txt: cli_idx = i
+                if "sms" in txt or "body" in txt or "message" in txt: sms_idx = i
+
         rows = soup.find_all("tr")
         
         cdrs = []
         for row in rows:
             cols = row.find_all("td")
-            if len(cols) >= 6:
-                cdr_date = cols[0].get_text(strip=True)
-                number = cols[2].get_text(strip=True)
-                cli = cols[3].get_text(strip=True)
-                sms_body = cols[5].get_text(strip=True)
+            if len(cols) >= 4:
+                cdr_date = cols[date_idx].get_text(strip=True)
+                number = cols[number_idx].get_text(strip=True)
+                cli = cols[cli_idx].get_text(strip=True)
+                sms_body = cols[sms_idx].get_text(strip=True)
+                
+                # Check if it looks like header row or empty
+                if "number" in number.lower() or not number:
+                    continue
                 
                 # Unique ID
                 message_id = re.sub(r'\s+', '', f"{cdr_date}_{number}_{cli}")
